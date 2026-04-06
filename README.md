@@ -1,24 +1,15 @@
-# workerpool
+# taskforeman
 
-A bounded, fault-tolerant async worker pipeline for Python 3.11+.
+A bounded, fault-tolerant async worker pipeline for Python 3.10+.
 
-Designed for workloads that require stateful, long-lived workers — browser
-automation, database connection pools, API clients, or anything where the
-worker itself needs lifecycle management. Failures escalate automatically
-through three levels: **retry → error accumulation → circuit breaker**.
+Designed for workloads that require stateful, long-lived workers — browser automation, API clients, database connection pools, or any workload where the worker itself needs lifecycle management. Failures escalate automatically through three levels: **retry → error accumulation → circuit breaker**.
 
 ---
 
 ## Installation
 
 ```bash
-pip install -e .
-```
-
-For development (includes pytest):
-
-```bash
-pip install -e ".[dev]"
+pip install taskforeman
 ```
 
 ---
@@ -27,7 +18,7 @@ pip install -e ".[dev]"
 
 ```python
 import asyncio
-from workerpool import BaseWorker, WorkerManager, WorkerSettings, WorkerException
+from taskforeman import BaseWorker, WorkerManager, WorkerPoolSettings, WorkerException
 
 class MyWorker(BaseWorker):
     async def start(self) -> None:
@@ -42,9 +33,10 @@ async def my_task(worker: MyWorker, url: str) -> None:
     page = await worker.driver.goto(url)
     if page.status == 429:
         raise WorkerException("rate limited", error=True)
+    await db.insert(page.content)
 
 async def main():
-    settings = WorkerSettings(max_size=4, rpm=60)
+    settings = WorkerPoolSettings(max_size=4, rpm=60)
     async with WorkerManager(MyWorker, settings) as manager:
         for url in urls:
             await manager.enqueue(my_task, url)
@@ -63,26 +55,42 @@ if __name__ == "__main__":
 
 ### Managed lifecycle
 
-The manager instantiates and owns all workers:
+The manager instantiates and owns all workers. Use this when all workers
+are identical:
 
 ```python
-async with WorkerManager(MyWorker, settings) as manager:
-    ...
+async with WorkerManager(MyWorker, pool_settings) as manager:
+    await manager.enqueue(my_task, item)
+    await manager.join()
 ```
 
 ### Bring your own workers
 
-Pre-construct workers with individual configuration, then hand them to the manager:
+Pre-construct workers with individual configuration, then hand them to the
+manager. Use this when workers need different proxies, credentials, or
+profiles:
 
 ```python
+from dataclasses import dataclass
+from taskforeman import WorkerSettings
+
+@dataclass
+class MyWorkerSettings(WorkerSettings):
+    proxy: str = ""
+    name: str = "worker"
+
 workers = [
-    MyWorker(settings, proxy="residential-1.example.com"),
-    MyWorker(settings, proxy="residential-2.example.com"),
-    MyWorker(settings, proxy="datacenter-1.example.com"),
+    MyWorker(MyWorkerSettings(proxy="residential-1.example.com", name="worker-0")),
+    MyWorker(MyWorkerSettings(proxy="residential-2.example.com", name="worker-1")),
 ]
-async with WorkerManager.from_workers(workers, settings) as manager:
-    ...
+
+async with WorkerManager.from_workers(workers, pool_settings) as manager:
+    await manager.enqueue(my_task, item)
+    await manager.join()
 ```
+
+Worker indices are assigned automatically by the manager. Access them via
+`worker.index` and `worker.worker_settings` inside your task callables.
 
 ---
 
@@ -94,8 +102,8 @@ or as flat keyword arguments (convenient for scripts).
 ### Nested
 
 ```python
-from workerpool import (
-    WorkerSettings,
+from taskforeman import (
+    WorkerPoolSettings,
     PoolSettings,
     RetrySettings,
     ErrorSettings,
@@ -103,7 +111,7 @@ from workerpool import (
     CircuitBreakerSettings,
 )
 
-settings = WorkerSettings(
+settings = WorkerPoolSettings(
     task_timeout    = 30.0,
     queue_maxsize   = 100,
     pool            = PoolSettings(max_size=4, restart_every=50),
@@ -117,7 +125,7 @@ settings = WorkerSettings(
 ### Flat
 
 ```python
-settings = WorkerSettings(
+settings = WorkerPoolSettings(
     max_size           = 4,
     restart_every      = 50,
     retry_max_attempts = 3,
@@ -146,7 +154,7 @@ settings = WorkerSettings(
 | `retry.backoff` | `2.0` | Multiplier applied to timeout on each attempt |
 | `error.max_accumulated` | `3` | Retry exhaustions before a circuit breaker trip fires |
 | `rate_limit.requests_per_minute` | `120.0` | Sustained RPM per worker; None disables |
-| `rate_limit.burst` | `1` | Token bucket capacity; 1 = strict uniform rate |
+| `rate_limit.burst` | `1` | Token bucket capacity; controls burst after idle periods |
 | `circuit_breaker.max_attempts` | `3` | Trips allowed before the program exits |
 | `circuit_breaker.timeout` | `10.0` | Base pause in seconds when the breaker opens |
 | `circuit_breaker.backoff` | `2.0` | Multiplier applied to timeout on each trip |
@@ -159,7 +167,7 @@ Raise `WorkerException` from inside any task callable to control how the
 worker handles the outcome.
 
 ```python
-from workerpool import WorkerException
+from taskforeman import WorkerException
 
 # Retry the task (counts against retry budget)
 raise WorkerException("busy", retry=True)
@@ -210,7 +218,7 @@ class ProxyDead(WorkerException):
 retry → error accumulation → circuit breaker
 ```
 
-1. **Retry** — the task is retried up to `retry.max_attempts` times, with
+1. **Retry** — the task is retried up to `retry.max_attempts` times with
    exponential backoff between attempts.
 
 2. **Error accumulation** — once the retry budget is exhausted, the failure
@@ -224,11 +232,32 @@ retry → error accumulation → circuit breaker
 
 ---
 
-## Running tests
+## Rate limiting
 
-```bash
-pytest
+Each worker maintains its own independent token bucket. Tokens refill at
+`requests_per_minute / 60` per second up to a maximum of `burst`. The
+first task always fires immediately. Subsequent tasks are throttled to the
+configured rate. If a worker sits idle, tokens accumulate up to `burst`,
+allowing a short burst of back-to-back tasks when work resumes.
+
+Set `rpm=None` to disable rate limiting entirely.
+
+---
+
+## Keyboard interrupt
+
+Wrap your entry point to handle `Ctrl+C` cleanly:
+
+```python
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
 ```
+
+`asyncio.run()` cancels all tasks and calls `__aexit__` on the manager
+before raising `KeyboardInterrupt`, closing all workers cleanly.
 
 ---
 
@@ -236,7 +265,7 @@ pytest
 
 ```
 src/
-  workerpool/
+  taskforeman/
     __init__.py
     config/
       settings.py
@@ -254,3 +283,18 @@ examples/
 pyproject.toml
 README.md
 ```
+
+---
+
+## Running tests
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+---
+
+## License
+
+MIT
