@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "taskforeman"
-version = "0.1.1"
+version = "0.1.2"
 description = "A bounded, fault-tolerant async worker pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
